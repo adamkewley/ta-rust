@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+
+procs=$(ps aux | grep ta-rust | grep -v "grep" | awk '{ print $2 }')
+args=''
+for proc in $procs; do
+    args="-p $proc $args"
+done;
+
+top $args

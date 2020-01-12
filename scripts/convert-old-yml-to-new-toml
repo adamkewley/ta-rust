@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+
+import yaml
+import toml
+import glob
+import os
+
+def render(game_id, d):
+    game = d["game"]
+    new_dict = {
+        'id': game_id,
+        'name': game["name"],
+        'description': game["description"],
+        'author': game["author"]["name"],
+        'application': game['boot']['application'],
+        'args': game['boot']['withArgs'],
+    }
+    return toml.dumps(new_dict)
+
+for pth in glob.glob("games/**/details.yml"):
+    game_id = os.path.basename(os.path.dirname(pth))
+    with open(pth, "rt") as f:
+        old_dict = yaml.load(f.read())
+        new_toml = render(game_id, old_dict)
+        
+    new_pth = pth.replace("details.yml", "textadventure.toml")
+    with open(new_pth, "wt") as f:
+        f.write(new_toml)
+
+
+old_style = """game:
+
+  name: Python Text Adventure Game
+
+  description: >-
+    
+    (from https://sourceforge.net/projects/pythontextadven/) This was a project I made for my python college class. It's just a fun little text adventure game.
+  
+  author:
+    name:  jruasap (sourceforge)
+
+  boot:
+    application: python2
+    withArgs:
+      - "-u"
+      - game.py"""
+
+
+new_style = """id = "{id}"
+name = "{name}"
+description = "{description}"
+author = "{author}"
+application = "{application}"
+args = [{args}"-m", "module"]"""
+
