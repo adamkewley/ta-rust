@@ -211,8 +211,8 @@ impl Actor for GameActor {
             let run_time = exited_at.duration_since(p.started_at);
 
             info!("game exited (id = {}): exit_code = {}, run_time = {} ms, stdin_bytes = {:?}, stdout_bytes = {:?}, stderr_bytes = {:?}",
-                  exit_code,
                   self.id,
+                  exit_code,
                   run_time.as_millis(),
                   p.num_stdin_bytes_read,
                   p.num_stdout_bytes_written,
@@ -414,6 +414,7 @@ async fn main() -> std::io::Result<()> {
     std::env::set_var("ACTIX_THREADPOOL", "1");
     env_logger::init();
 
+    // TODO: bind port
     let cli_args: io::Result<CliArgs> = {
         let matches = clap::App::new("Text")
             .author("Adam Kewley <adamk117@gmail.com>")
@@ -453,6 +454,8 @@ async fn main() -> std::io::Result<()> {
     let games_config =
         Arc::new(load_game_configs(&games_dir)?);
 
+    // TODO: crash if static/ doesn't exist
+
     info!("starting actix HttpServer");
     HttpServer::new(move || {
         let st = ServerState {
@@ -470,7 +473,7 @@ async fn main() -> std::io::Result<()> {
             .service(actix_files::Files::new("/", "static/").index_file("index.html"))
     })
     .workers(1)
-    .bind(SocketAddr::from(([127, 0, 0, 1], cli_args.port)))?
+    .bind(SocketAddr::from(([0, 0, 0, 0], cli_args.port)))?
     .run()
     .await
 }
