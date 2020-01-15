@@ -2,12 +2,13 @@ use std::path::{Path, PathBuf};
 use std::fs::{self, File};
 use std::io::{self, ErrorKind, Read, Write};
 use std::sync::{Arc};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::collections::{HashMap};
 use std::net::SocketAddr;
 use std::process::{Command, Child, Stdio};
 use std::thread::{self};
 use std::sync::mpsc;
+use std::time::Instant;
 
 use actix::{Actor, Running, Message, Handler, StreamHandler, ActorContext, AsyncContext};
 use actix_web::{web, http, App, HttpRequest, HttpResponse, HttpServer, Responder, body::Body};
@@ -17,6 +18,7 @@ use bytes::Bytes;
 use serde_derive::{Deserialize, Serialize};
 use clap;
 use toml;
+#[macro_use] extern crate log;
 
 #[derive(Serialize, Deserialize)]
 struct GamesResponse {
@@ -38,6 +40,7 @@ struct GamePlayDetailsResponse {
 }
 
 struct ServerState {
+    next_game_id: AtomicUsize,
     games_response_json: Vec<u8>,
     games_dir: PathBuf,
     configs_by_id: HashMap<String, GameConfig>,
@@ -70,6 +73,7 @@ fn to_games_json(configs: &Vec<GameConfig>) -> Vec<u8> {
         games: configs.iter().map(|cfg| to_game_response(cfg)).collect(),
     };
 
+    // TODO: propagate Result
     serde_json::to_vec_pretty(&resp).unwrap()
 }
 
@@ -110,6 +114,7 @@ fn load_game_configs(games_dir: &Path) -> std::io::Result<Vec<GameConfig>> {
         let entry = entry?;
         let path = entry.path();
 
+        // TODO: propagate invalid path errors
         if should_ignore(&path.file_name().unwrap().to_str().unwrap()) {
             continue;
         }
@@ -121,7 +126,9 @@ fn load_game_configs(games_dir: &Path) -> std::io::Result<Vec<GameConfig>> {
         let cfg_path = path.join("textadventure.toml");
 
         if cfg_path.is_file() {
-            configs.push(load_config(&cfg_path)?);
+            let cfg = load_config(&cfg_path)?;
+            info!("loaded {:?}: id = {}, name = {}, application = {}", cfg_path, cfg.id, cfg.name, cfg.application);
+            configs.push(cfg);
         }
     }
 
@@ -143,9 +150,15 @@ enum ProcessSt {
 struct BootedProcess {
     process: Child,
     stdin: mpsc::Sender<Vec<u8>>,
+
+    started_at: Instant,
+    num_stdout_bytes_written: Arc<AtomicUsize>,
+    num_stderr_bytes_written: Arc<AtomicUsize>,
+    num_stdin_bytes_read: Arc<AtomicUsize>,
 }
 
-struct SubprocessActor {
+struct GameActor {
+    id: usize,
     config: GameConfig,
     game_dir: PathBuf,
     process_st: ProcessSt,
@@ -165,9 +178,10 @@ impl Message for ExitMsg {
     type Result = ();
 }
 
-impl SubprocessActor {
-    fn new(game_dir: PathBuf, config: GameConfig) -> Self {
+impl GameActor {
+    fn new(id: usize, game_dir: PathBuf, config: GameConfig) -> Self {
         Self {
+            id: id,
             game_dir: game_dir,
             config: config,
             process_st: ProcessSt::Booting
@@ -175,23 +189,45 @@ impl SubprocessActor {
     }
 }
 
-impl Actor for SubprocessActor {
+impl Actor for GameActor {
     type Context = ws::WebsocketContext<Self>;
 
     fn stopping(&mut self, _ctx: &mut Self::Context) -> Running {
         if let ProcessSt::Booted(p) = &mut self.process_st {
-            p.process.kill().unwrap();
-            p.process.wait().unwrap();
+            if let Err(_) = p.process.kill() {
+                error!("game double-killed (id = {}): this is a developer error", self.id);
+            };
+
+            let exit_code = match p.process.wait() {
+                // TODO: Handle signal exit code (rather than coercing it to 1)
+                Ok(exit_code) => exit_code.code().unwrap_or(1),
+                Err(e) => {
+                    error!("error waiting for game (id = {}): it probably didn't start running: {:?}", self.id, e);
+                    1
+                }
+            };
+
+            let exited_at = Instant::now();
+            let run_time = exited_at.duration_since(p.started_at);
+
+            info!("game exited (id = {}): exit_code = {}, run_time = {} ms, stdin_bytes = {:?}, stdout_bytes = {:?}, stderr_bytes = {:?}",
+                  exit_code,
+                  self.id,
+                  run_time.as_millis(),
+                  p.num_stdin_bytes_read,
+                  p.num_stdout_bytes_written,
+                  p.num_stderr_bytes_written);
         }
+
+
         self.process_st = ProcessSt::Exited;
         Running::Stop
     }
 }
 
-impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for SubprocessActor {
+impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for GameActor {
 
     fn started(&mut self, ctx: &mut Self::Context) {
-        
         let mut b = Command::new(&self.config.application);
         b.args(self.config.args.iter());
         b.stdin(Stdio::piped());
@@ -199,19 +235,23 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for SubprocessActor {
         b.stderr(Stdio::piped());
         b.current_dir(&self.game_dir);
 
+        info!("game booting (id = {}): application = {}, args = {:?}", self.id, self.config.application, self.config.args);
         match b.spawn() {
             Ok(mut proc) => {
+                let started_at = Instant::now();
+                let id = self.id;
+
+                let num_stdout_bytes_written = Arc::new(AtomicUsize::new(0));
+                let num_stderr_bytes_written = Arc::new(AtomicUsize::new(0));
+                let num_stdin_bytes_read = Arc::new(AtomicUsize::new(0));
                 let should_send_exit = Arc::new(AtomicBool::new(true));
 
+                let stdout_thread_name = format!("game_id {}: stdout reader", id);
                 let stdout_addr = ctx.address();
-                let stderr_addr = stdout_addr.clone();
                 let mut stdout = proc.stdout.take().unwrap();
-                let mut stderr = proc.stderr.take().unwrap();
-                let mut stdin = proc.stdin.take().unwrap();
                 let stdout_should_send_exit = should_send_exit.clone();
-                let stderr_should_send_exit = should_send_exit;
-
-                thread::Builder::new().name("stdout_thread".to_string()).spawn(move || {
+                let stdout_num_stdout_bytes_written = num_stdout_bytes_written.clone();
+                thread::Builder::new().name(stdout_thread_name).spawn(move || {
                     let addr = stdout_addr;
 
                     loop {
@@ -219,6 +259,7 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for SubprocessActor {
                         let sz = stdout.read(&mut buf).unwrap_or(0);
 
                         if sz > 0 {
+                            stdout_num_stdout_bytes_written.fetch_add(sz, Ordering::Relaxed);
                             let bytes = Bytes::copy_from_slice(&buf[0..sz]);
                             addr.do_send(StdoutMsg { bytes: bytes });
                         } else {
@@ -230,7 +271,12 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for SubprocessActor {
                     }
                 }).unwrap();
 
-                thread::Builder::new().name("stderr_thread".to_string()).spawn(move || {
+                let stderr_addr = ctx.address();
+                let mut stderr = proc.stderr.take().unwrap();
+                let stderr_thread_name = format!("game_id {}: stderr reader", id);
+                let stderr_should_send_exit = should_send_exit;
+                let stderr_num_stderr_bytes_written = num_stderr_bytes_written.clone();
+                thread::Builder::new().name(stderr_thread_name).spawn(move || {
                     let addr = stderr_addr;
 
                     loop {
@@ -238,6 +284,7 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for SubprocessActor {
                         let sz = stderr.read(&mut buf).unwrap_or(0);
 
                         if sz > 0 {
+                            stderr_num_stderr_bytes_written.fetch_add(sz, Ordering::Relaxed);
                             let bytes = Bytes::copy_from_slice(&buf[0..sz]);
                             addr.do_send(StdoutMsg { bytes: bytes });
                         } else {
@@ -249,13 +296,19 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for SubprocessActor {
                     }
                 }).unwrap();
 
+                let mut stdin = proc.stdin.take().unwrap();
                 let (tx, rx) = mpsc::channel::<Vec<u8>>();
-                thread::Builder::new().name("stdin_thread".to_string()).spawn(move || {
+                let stdin_thread_name = format!("game_id {}: stdin writer", id);
+                let stdin_num_stdin_bytes_read = num_stdin_bytes_read.clone();
+                thread::Builder::new().name(stdin_thread_name).spawn(move || {
                     loop {
                         match rx.recv() {
                             Ok(buf) => {
                                 match stdin.write(&buf) {
-                                    Ok(_) => stdin.flush().unwrap(),
+                                    Ok(_) => {
+                                        stdin_num_stdin_bytes_read.fetch_add(buf.len(), Ordering::Relaxed);
+                                        stdin.flush().unwrap();
+                                    },
                                     Err(_) => break,  // TODO
                                 }
                             },
@@ -267,10 +320,14 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for SubprocessActor {
                 self.process_st = ProcessSt::Booted(BootedProcess {
                     process: proc,
                     stdin: tx,
+                    started_at: started_at,
+                    num_stdout_bytes_written: num_stdout_bytes_written.clone(),
+                    num_stderr_bytes_written: num_stderr_bytes_written.clone(),
+                    num_stdin_bytes_read: num_stdin_bytes_read.clone(),
                 });
             },
             Err(e) => {
-                ctx.text(e.to_string());
+                error!("game could not be spawned (id = {}): {:?}", self.id, e);
                 ctx.stop();
             },
         }
@@ -285,12 +342,16 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for SubprocessActor {
             Ok(ws::Message::Ping(msg)) => ctx.pong(&msg),
             Ok(ws::Message::Text(text)) => {
                 if let ProcessSt::Booted(p) = &mut self.process_st {
-                    p.stdin.send(text.into_bytes()).unwrap();
+                    if let Err(e) = p.stdin.send(text.into_bytes()) {
+                        error!("error sending text to game process stdin (id = {}): {:?}", self.id, e);
+                    };
                 }
             },
             Ok(ws::Message::Binary(bin)) => {
                 if let ProcessSt::Booted(p) = &mut self.process_st {
-                    p.stdin.send(bin.to_vec()).unwrap();
+                    if let Err(e) = p.stdin.send(bin.to_vec()) {
+                        error!("error sending binary to game process stdin (id = {}): {:?}", self.id, e);
+                    };
                 }
             },
             Ok(ws::Message::Close(_)) => {
@@ -310,7 +371,7 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for SubprocessActor {
     }
 }
 
-impl Handler<StdoutMsg> for SubprocessActor {
+impl Handler<StdoutMsg> for GameActor {
     type Result = ();
 
     fn handle(&mut self, msg: StdoutMsg, ctx: &mut Self::Context) -> Self::Result {
@@ -318,7 +379,7 @@ impl Handler<StdoutMsg> for SubprocessActor {
     }
 }
 
-impl Handler<ExitMsg> for SubprocessActor {
+impl Handler<ExitMsg> for GameActor {
     type Result = ();
 
     fn handle(&mut self, _msg: ExitMsg, ctx: &mut Self::Context) -> Self::Result {
@@ -334,7 +395,8 @@ async fn play(st: web::Data<ServerState>,
     match st.configs_by_id.get(gameid) {
         Some(cfg) => {
             let game_dir = st.games_dir.join(gameid).join("game-files");
-            let actor = SubprocessActor::new(game_dir, cfg.clone());
+            let game_id = st.next_game_id.fetch_add(1, Ordering::Relaxed);
+            let actor = GameActor::new(game_id, game_dir, cfg.clone());
             ws::start(actor, &req, stream)
         }
         None => Ok(HttpResponse::NotFound().finish()),
@@ -348,6 +410,10 @@ struct CliArgs {
 
 #[actix_rt::main]
 async fn main() -> std::io::Result<()> {
+    std::env::set_var("RUST_LOG", "info");
+    std::env::set_var("ACTIX_THREADPOOL", "1");
+    env_logger::init();
+
     let cli_args: io::Result<CliArgs> = {
         let matches = clap::App::new("Text")
             .author("Adam Kewley <adamk117@gmail.com>")
@@ -378,14 +444,19 @@ async fn main() -> std::io::Result<()> {
         Ok(CliArgs{ games_dir: games_dir, port: port })
     };
     let cli_args = cli_args?;
+    info!("bootup args: games_dir = {}, port = {}", cli_args.games_dir, cli_args.port);
 
     let games_dir = PathBuf::from(&cli_args.games_dir);
 
+    info!("starting bootup");
+    info!("loading game configs by iterating over dirs in {:?}", games_dir);
     let games_config =
-        Arc::new(load_game_configs(&games_dir).unwrap());
+        Arc::new(load_game_configs(&games_dir)?);
 
+    info!("starting actix HttpServer");
     HttpServer::new(move || {
         let st = ServerState {
+            next_game_id: AtomicUsize::new(0),
             games_response_json: to_games_json(&games_config),
             games_dir: games_dir.clone(),
             configs_by_id: games_config.iter().map(|cfg| (cfg.id.clone(), cfg.clone())).collect(),
@@ -393,6 +464,7 @@ async fn main() -> std::io::Result<()> {
 
         App::new()
             .data(st)
+            .wrap(actix_web::middleware::Logger::default())
             .route("/api/games", web::get().to(games))
             .route("/api/play/{gameid}", web::get().to(play))
             .service(actix_files::Files::new("/", "static/").index_file("index.html"))
