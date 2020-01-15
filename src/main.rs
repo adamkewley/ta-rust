@@ -1,12 +1,13 @@
 use std::path::{Path, PathBuf};
 use std::fs::{self, File};
-use std::io::{self, ErrorKind, Read};
+use std::io::{self, ErrorKind, Read, Write};
 use std::sync::{Arc};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::collections::{HashMap};
 use std::net::SocketAddr;
 use std::process::{Command, Child, Stdio};
 use std::thread::{self};
+use std::sync::mpsc;
 
 use actix::{Actor, Running, Message, Handler, StreamHandler, ActorContext, AsyncContext};
 use actix_web::{web, http, App, HttpRequest, HttpResponse, HttpServer, Responder, body::Body};
@@ -16,7 +17,6 @@ use bytes::Bytes;
 use serde_derive::{Deserialize, Serialize};
 use clap;
 use toml;
-
 
 #[derive(Serialize, Deserialize)]
 struct GamesResponse {
@@ -142,6 +142,7 @@ enum ProcessSt {
 
 struct BootedProcess {
     process: Child,
+    stdin: mpsc::Sender<Vec<u8>>,
 }
 
 struct SubprocessActor {
@@ -206,6 +207,7 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for SubprocessActor {
                 let stderr_addr = stdout_addr.clone();
                 let mut stdout = proc.stdout.take().unwrap();
                 let mut stderr = proc.stderr.take().unwrap();
+                let mut stdin = proc.stdin.take().unwrap();
                 let stdout_should_send_exit = should_send_exit.clone();
                 let stderr_should_send_exit = should_send_exit;
 
@@ -247,8 +249,24 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for SubprocessActor {
                     }
                 }).unwrap();
 
+                let (tx, rx) = mpsc::channel::<Vec<u8>>();
+                thread::Builder::new().name("stdin_thread".to_string()).spawn(move || {
+                    loop {
+                        match rx.recv() {
+                            Ok(buf) => {
+                                match stdin.write(&buf) {
+                                    Ok(_) => stdin.flush().unwrap(),
+                                    Err(_) => break,  // TODO
+                                }
+                            },
+                            Err(_) => break,  // TODO: error propagation
+                        }
+                    }
+                }).unwrap();
+
                 self.process_st = ProcessSt::Booted(BootedProcess {
                     process: proc,
+                    stdin: tx,
                 });
             },
             Err(e) => {
@@ -265,8 +283,16 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for SubprocessActor {
     ) {
         match msg {
             Ok(ws::Message::Ping(msg)) => ctx.pong(&msg),
-            Ok(ws::Message::Text(text)) => ctx.text(text),
-            Ok(ws::Message::Binary(bin)) => ctx.binary(bin),
+            Ok(ws::Message::Text(text)) => {
+                if let ProcessSt::Booted(p) = &mut self.process_st {
+                    p.stdin.send(text.into_bytes()).unwrap();
+                }
+            },
+            Ok(ws::Message::Binary(bin)) => {
+                if let ProcessSt::Booted(p) = &mut self.process_st {
+                    p.stdin.send(bin.to_vec()).unwrap();
+                }
+            },
             Ok(ws::Message::Close(_)) => {
                 // Firefox sends this *before* closing the TCP
                 // channel. Can cause leak-like behavior in Firefox

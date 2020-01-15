@@ -60,7 +60,7 @@ function onPlayerKeydown(e) {
 
     if (keyPressed === "Enter") {
 	writePlayerText(userInputEl.value);
-	gameSocket.send(userInputEl.value);
+	gameSocket.send(userInputEl.value + "\n");
 	userInputEl.value = "";
     }
 }
