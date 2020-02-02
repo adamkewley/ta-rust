@@ -4,7 +4,7 @@ use std::io::{self, ErrorKind, Read, Write};
 use std::sync::{Arc};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::collections::{HashMap};
-use std::net::SocketAddr;
+use std::net::{SocketAddr};
 use std::process::{Command, Child, Stdio};
 use std::thread::{self, JoinHandle};
 use std::sync::mpsc;
@@ -120,7 +120,6 @@ fn load_game_configs(games_dir: &Path) -> std::io::Result<Vec<GameConfig>> {
         let entry = entry?;
         let path = entry.path();
 
-        // TODO: propagate invalid path errors
         if should_ignore(&path)? {
             continue;
         }
@@ -455,7 +454,69 @@ async fn play(st: web::Data<ServerState>,
 
 struct CliArgs {
     games_dir: String,
-    port: u16,
+    socket_addr: SocketAddr,
+    static_dir: PathBuf,
+}
+
+fn parse_cli_args() -> io::Result<CliArgs> {
+    let matches = clap::App::new("Text")
+        .author("Adam Kewley <adamk117@gmail.com>")
+        .about("Boots Textadventurer webserver daemon")
+        .arg(clap::Arg::with_name("GAMES_DIR")
+             .help("Directory containing game definitions")
+             .required(true))
+        .arg(clap::Arg::with_name("port")
+             .short("p")
+             .long("port")
+             .value_name("PORT_NUMBER")
+             .help("TCP port the daemon should listen on")
+             .default_value("8080")
+             .takes_value(true))
+        .arg(clap::Arg::with_name("binding")
+             .short("b")
+             .long("binding")
+             .value_name("IP")
+             .help("Binds server to the specified IP")
+             .default_value("0.0.0.0")
+             .takes_value(true))
+        .arg(clap::Arg::with_name("static_assets")
+             .short("s")
+             .long("static-assets")
+             .value_name("DIR")
+             .help("Directory from which static assets are served. The directory maps to the root of the server.")
+             .default_value("static/")
+             .takes_value(true))
+        .get_matches();
+
+    let games_dir: String = matches.value_of("GAMES_DIR").unwrap().to_string();
+
+    let port: u16 = {
+        let port_str = matches.value_of("port").unwrap();
+        let maybe_port_num = match port_str.parse::<u16>() {
+            Ok(port) => Ok(port),
+            Err(_) => Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{}: not a valid number", port_str))),
+        };
+        maybe_port_num?
+    };
+
+    let ip = {
+        let ip_str = matches.value_of("binding").unwrap();
+        ip_str.parse().map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("{}: not a valid IPv4 address", ip_str)))?
+    };
+
+    let socket_addr = SocketAddr::new(ip, port);
+
+    let static_dir: PathBuf = matches.value_of("static_assets").unwrap().to_string().parse().unwrap();
+
+    if !static_dir.exists() {
+        Err(io::Error::new(io::ErrorKind::NotFound, format!("{:?}: no such file or directory", static_dir)))?
+    }
+
+    if !static_dir.is_dir() {
+        Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{:?}: is not a directory", static_dir)))?
+    }
+
+    Ok(CliArgs{ games_dir: games_dir, socket_addr: socket_addr, static_dir: static_dir })
 }
 
 #[actix_rt::main]
@@ -464,51 +525,18 @@ async fn main() -> std::io::Result<()> {
     std::env::set_var("ACTIX_THREADPOOL", "1");
     env_logger::init();
 
-    // TODO: bind port
-    let cli_args: io::Result<CliArgs> = {
-        let matches = clap::App::new("Text")
-            .author("Adam Kewley <adamk117@gmail.com>")
-            .about("Boots Textadventurer webserver daemon")
-            .arg(clap::Arg::with_name("GAMES_DIR")
-                 .help("Directory containing game definitions")
-                 .required(true))
-            .arg(clap::Arg::with_name("port")
-                 .short("p")
-                 .long("port")
-                 .value_name("PORT_NUMBER")
-                 .help("TCP port the daemon should listen on")
-                 .default_value("8080")
-                 .takes_value(true))
-            .get_matches();
-
-        let games_dir: String = matches.value_of("GAMES_DIR").unwrap().to_string();
-
-        let port: u16 = {
-            let port_str = matches.value_of("port").unwrap();
-            let maybe_port_num = match port_str.parse::<u16>() {
-                Ok(port) => Ok(port),
-                Err(_) => Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{}: not a valid number", port_str))),
-            };
-            maybe_port_num?
-        };
-
-        Ok(CliArgs{ games_dir: games_dir, port: port })
-    };
-    let cli_args = cli_args?;
-    info!("bootup args: games_dir = {}, port = {}", cli_args.games_dir, cli_args.port);
+    let cli_args = parse_cli_args()?;
+    info!("bootup args: games_dir = {}, socket_addr = {:?}, static_dir = {:?}", cli_args.games_dir, cli_args.socket_addr, cli_args.static_dir);
 
     let games_dir = PathBuf::from(&cli_args.games_dir);
 
     info!("starting bootup");
     info!("loading game configs by iterating over dirs in {:?}", games_dir);
-    let games_config =
-        Arc::new(load_game_configs(&games_dir)?);
-
-    // TODO: crash if static/ doesn't exist
+    let games_config = Arc::new(load_game_configs(&games_dir)?);
 
     info!("starting actix HttpServer");
-    info!("static content will be served from static/");
     let games_response_json = Bytes::from(to_games_json(&games_config)?);
+    let static_dir = cli_args.static_dir;
     HttpServer::new(move || {
         let st = ServerState {
             next_game_id: AtomicUsize::new(0),
@@ -522,10 +550,10 @@ async fn main() -> std::io::Result<()> {
             .wrap(actix_web::middleware::Logger::default())
             .route("/api/games", web::get().to(games))
             .route("/api/play/{gameid}", web::get().to(play))
-            .service(actix_files::Files::new("/", "static/").index_file("index.html"))
+            .service(actix_files::Files::new("/", static_dir.clone()).index_file("index.html"))
     })
     .workers(1)
-    .bind(SocketAddr::from(([0, 0, 0, 0], cli_args.port)))?
+    .bind(cli_args.socket_addr)?
     .run()
     .await
 }
