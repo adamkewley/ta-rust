@@ -6,9 +6,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::collections::{HashMap};
 use std::net::SocketAddr;
 use std::process::{Command, Child, Stdio};
-use std::thread::{self};
+use std::thread::{self, JoinHandle};
 use std::sync::mpsc;
 use std::time::Instant;
+use std::mem;
 
 use actix::{Actor, Running, Message, Handler, StreamHandler, ActorContext, AsyncContext};
 use actix_web::{web, http, App, HttpRequest, HttpResponse, HttpServer, Responder, body::Body};
@@ -41,7 +42,7 @@ struct GamePlayDetailsResponse {
 
 struct ServerState {
     next_game_id: AtomicUsize,
-    games_response_json: Vec<u8>,
+    games_response_json: Bytes,
     games_dir: PathBuf,
     configs_by_id: HashMap<String, GameConfig>,
 }
@@ -138,7 +139,7 @@ fn load_game_configs(games_dir: &Path) -> std::io::Result<Vec<GameConfig>> {
 async fn games(st: web::Data<ServerState>) -> impl Responder {
     HttpResponse::Ok()
         .header(http::header::CONTENT_TYPE, "application/json")
-        .body(Body::from_slice(&st.games_response_json))
+        .body(Body::Bytes(st.games_response_json.clone()))
 }
 
 enum ProcessSt {
@@ -147,14 +148,26 @@ enum ProcessSt {
     Exited,
 }
 
+struct StdoutStats {
+    bytes_written: usize,
+}
+
+struct StderrStats {
+    bytes_written: usize,
+}
+
+struct StdinStats {
+    bytes_read: usize,
+}
+
 struct BootedProcess {
     process: Child,
     stdin: mpsc::Sender<Vec<u8>>,
 
     started_at: Instant,
-    num_stdout_bytes_written: Arc<AtomicUsize>,
-    num_stderr_bytes_written: Arc<AtomicUsize>,
-    num_stdin_bytes_read: Arc<AtomicUsize>,
+    stdout_thr: JoinHandle<StdoutStats>,
+    stderr_thr: JoinHandle<StderrStats>,
+    stdin_thr: JoinHandle<StdinStats>,
 }
 
 struct GameActor {
@@ -193,12 +206,23 @@ impl Actor for GameActor {
     type Context = ws::WebsocketContext<Self>;
 
     fn stopping(&mut self, _ctx: &mut Self::Context) -> Running {
-        if let ProcessSt::Booted(p) = &mut self.process_st {
-            if let Err(_) = p.process.kill() {
+        let st = mem::replace(&mut self.process_st, ProcessSt::Exited);
+
+        if let ProcessSt::Booted(p) = st {
+            let BootedProcess  {
+                mut process,
+                stdin: _,
+                started_at: _,
+                stdin_thr,
+                stdout_thr,
+                stderr_thr
+            } = p;
+
+            if let Err(_) = process.kill() {
                 error!("game double-killed (id = {}): this is a developer error", self.id);
             };
 
-            let exit_code = match p.process.wait() {
+            let exit_code = match process.wait() {
                 // TODO: Handle signal exit code (rather than coercing it to 1)
                 Ok(exit_code) => exit_code.code().unwrap_or(1),
                 Err(e) => {
@@ -214,13 +238,11 @@ impl Actor for GameActor {
                   self.id,
                   exit_code,
                   run_time.as_millis(),
-                  p.num_stdin_bytes_read,
-                  p.num_stdout_bytes_written,
-                  p.num_stderr_bytes_written);
+                  stdin_thr.join().unwrap().bytes_read,
+                  stdout_thr.join().unwrap().bytes_written,
+                  stderr_thr.join().unwrap().bytes_written);
         }
 
-
-        self.process_st = ProcessSt::Exited;
         Running::Stop
     }
 }
@@ -240,26 +262,22 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for GameActor {
             Ok(mut proc) => {
                 let started_at = Instant::now();
                 let id = self.id;
-
-                let num_stdout_bytes_written = Arc::new(AtomicUsize::new(0));
-                let num_stderr_bytes_written = Arc::new(AtomicUsize::new(0));
-                let num_stdin_bytes_read = Arc::new(AtomicUsize::new(0));
                 let should_send_exit = Arc::new(AtomicBool::new(true));
 
                 let stdout_thread_name = format!("game_id {}: stdout reader", id);
                 let stdout_addr = ctx.address();
                 let mut stdout = proc.stdout.take().unwrap();
                 let stdout_should_send_exit = should_send_exit.clone();
-                let stdout_num_stdout_bytes_written = num_stdout_bytes_written.clone();
-                thread::Builder::new().name(stdout_thread_name).spawn(move || {
+                let stdout_thr = thread::Builder::new().name(stdout_thread_name).spawn(move || {
                     let addr = stdout_addr;
+                    let mut buf: [u8; 512] = [0; 512];
+                    let mut bytes_written = 0;
 
                     loop {
-                        let mut buf: [u8; 512] = [0; 512];
                         let sz = stdout.read(&mut buf).unwrap_or(0);
 
                         if sz > 0 {
-                            stdout_num_stdout_bytes_written.fetch_add(sz, Ordering::Relaxed);
+                            bytes_written += sz;
                             let bytes = Bytes::copy_from_slice(&buf[0..sz]);
                             addr.do_send(StdoutMsg { bytes: bytes });
                         } else {
@@ -269,22 +287,23 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for GameActor {
                             break;
                         }
                     }
+                    return StdoutStats { bytes_written: bytes_written };
                 }).unwrap();
 
                 let stderr_addr = ctx.address();
                 let mut stderr = proc.stderr.take().unwrap();
                 let stderr_thread_name = format!("game_id {}: stderr reader", id);
                 let stderr_should_send_exit = should_send_exit;
-                let stderr_num_stderr_bytes_written = num_stderr_bytes_written.clone();
-                thread::Builder::new().name(stderr_thread_name).spawn(move || {
+                let stderr_thr = thread::Builder::new().name(stderr_thread_name).spawn(move || {
                     let addr = stderr_addr;
+                    let mut buf: [u8; 512] = [0; 512];
+                    let mut bytes_written = 0;
 
                     loop {
-                        let mut buf: [u8; 512] = [0; 512];
                         let sz = stderr.read(&mut buf).unwrap_or(0);
 
                         if sz > 0 {
-                            stderr_num_stderr_bytes_written.fetch_add(sz, Ordering::Relaxed);
+                            bytes_written += sz;
                             let bytes = Bytes::copy_from_slice(&buf[0..sz]);
                             addr.do_send(StdoutMsg { bytes: bytes });
                         } else {
@@ -294,19 +313,21 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for GameActor {
                             break;
                         }
                     }
+
+                    return StderrStats { bytes_written: bytes_written };
                 }).unwrap();
 
                 let mut stdin = proc.stdin.take().unwrap();
                 let (tx, rx) = mpsc::channel::<Vec<u8>>();
                 let stdin_thread_name = format!("game_id {}: stdin writer", id);
-                let stdin_num_stdin_bytes_read = num_stdin_bytes_read.clone();
-                thread::Builder::new().name(stdin_thread_name).spawn(move || {
+                let stdin_thr = thread::Builder::new().name(stdin_thread_name).spawn(move || {
+                    let mut bytes_read = 0;
                     loop {
                         match rx.recv() {
                             Ok(buf) => {
                                 match stdin.write(&buf) {
                                     Ok(_) => {
-                                        stdin_num_stdin_bytes_read.fetch_add(buf.len(), Ordering::Relaxed);
+                                        bytes_read += buf.len();
                                         stdin.flush().unwrap();
                                     },
                                     Err(_) => break,  // TODO
@@ -315,15 +336,17 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for GameActor {
                             Err(_) => break,  // TODO: error propagation
                         }
                     }
+
+                    return StdinStats { bytes_read: bytes_read };
                 }).unwrap();
 
                 self.process_st = ProcessSt::Booted(BootedProcess {
                     process: proc,
                     stdin: tx,
                     started_at: started_at,
-                    num_stdout_bytes_written: num_stdout_bytes_written.clone(),
-                    num_stderr_bytes_written: num_stderr_bytes_written.clone(),
-                    num_stdin_bytes_read: num_stdin_bytes_read.clone(),
+                    stdout_thr: stdout_thr,
+                    stderr_thr: stderr_thr,
+                    stdin_thr: stdin_thr,
                 });
             },
             Err(e) => {
@@ -460,7 +483,7 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         let st = ServerState {
             next_game_id: AtomicUsize::new(0),
-            games_response_json: to_games_json(&games_config),
+            games_response_json: Bytes::from(to_games_json(&games_config)),
             games_dir: games_dir.clone(),
             configs_by_id: games_config.iter().map(|cfg| (cfg.id.clone(), cfg.clone())).collect(),
         };
