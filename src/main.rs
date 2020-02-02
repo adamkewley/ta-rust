@@ -69,24 +69,29 @@ fn to_game_response(config: &GameConfig) -> GameResponse {
     }
 }
 
-fn to_games_json(configs: &Vec<GameConfig>) -> Vec<u8> {
+fn to_games_json(configs: &Vec<GameConfig>) -> Result<Vec<u8>, serde_json::error::Error> {
     let resp = GamesResponse {
         games: configs.iter().map(|cfg| to_game_response(cfg)).collect(),
     };
 
-    // TODO: propagate Result
-    serde_json::to_vec_pretty(&resp).unwrap()
+    serde_json::to_vec_pretty(&resp)
 }
 
-fn should_ignore(game_dirname: &str) -> bool {
+fn should_ignore(path: &Path) -> io::Result<bool> {
+    let game_dirname = &path
+        .file_name()
+        .ok_or(io::Error::new(ErrorKind::Other, format!("{:?}: invalid path in games dir", path)))?
+        .to_str()
+        .unwrap();
+
     if let Some(c) = game_dirname.chars().next() {
         match c {
-            '.' => true,
-            '#' => true,
-            _ => false,
+            '.' => Ok(true),
+            '#' => Ok(true),
+            _ => Ok(false),
         }
     } else {
-        false
+        Ok(false)
     }
 }
 
@@ -116,7 +121,7 @@ fn load_game_configs(games_dir: &Path) -> std::io::Result<Vec<GameConfig>> {
         let path = entry.path();
 
         // TODO: propagate invalid path errors
-        if should_ignore(&path.file_name().unwrap().to_str().unwrap()) {
+        if should_ignore(&path)? {
             continue;
         }
 
@@ -148,6 +153,11 @@ enum ProcessSt {
     Exited,
 }
 
+enum StdinMessage {
+    Data(Vec<u8>),
+    Eof,
+}
+
 struct StdoutStats {
     bytes_written: usize,
 }
@@ -162,7 +172,7 @@ struct StdinStats {
 
 struct BootedProcess {
     process: Child,
-    stdin: mpsc::Sender<Vec<u8>>,
+    stdin: mpsc::Sender<StdinMessage>,
 
     started_at: Instant,
     stdout_thr: JoinHandle<StdoutStats>,
@@ -211,7 +221,7 @@ impl Actor for GameActor {
         if let ProcessSt::Booted(p) = st {
             let BootedProcess  {
                 mut process,
-                stdin: _,
+                stdin,
                 started_at: _,
                 stdin_thr,
                 stdout_thr,
@@ -234,13 +244,24 @@ impl Actor for GameActor {
             let exited_at = Instant::now();
             let run_time = exited_at.duration_since(p.started_at);
 
+            // The stdin thread might be waiting on input still, so
+            // ensure that it receives at least one EOF
+            let _ = stdin.send(StdinMessage::Eof);
+            let stdin_result = stdin_thr.join().unwrap();
+
+            // These threads block on reading data from the
+            // subprocess. The reads will fail for an exited process,
+            // so this is ok.
+            let stdout_result = stdout_thr.join().unwrap();
+            let stderr_result = stderr_thr.join().unwrap();
+
             info!("game exited (id = {}): exit_code = {}, run_time = {} ms, stdin_bytes = {:?}, stdout_bytes = {:?}, stderr_bytes = {:?}",
                   self.id,
                   exit_code,
                   run_time.as_millis(),
-                  stdin_thr.join().unwrap().bytes_read,
-                  stdout_thr.join().unwrap().bytes_written,
-                  stderr_thr.join().unwrap().bytes_written);
+                  stdin_result.bytes_read,
+                  stdout_result.bytes_written,
+                  stderr_result.bytes_written);
         }
 
         Running::Stop
@@ -318,20 +339,26 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for GameActor {
                 }).unwrap();
 
                 let mut stdin = proc.stdin.take().unwrap();
-                let (tx, rx) = mpsc::channel::<Vec<u8>>();
+                let (tx, rx) = mpsc::channel::<StdinMessage>();
                 let stdin_thread_name = format!("game_id {}: stdin writer", id);
                 let stdin_thr = thread::Builder::new().name(stdin_thread_name).spawn(move || {
                     let mut bytes_read = 0;
                     loop {
                         match rx.recv() {
-                            Ok(buf) => {
-                                match stdin.write(&buf) {
-                                    Ok(_) => {
-                                        bytes_read += buf.len();
-                                        stdin.flush().unwrap();
+                            Ok(msg) => {
+                                match msg {
+                                    StdinMessage::Data(buf) => {
+                                        match stdin.write(&buf) {
+                                            Ok(_) => {
+                                                bytes_read += buf.len();
+                                                stdin.flush().unwrap();
+                                            },
+                                            Err(_) => break,  // TODO
+                                        }
                                     },
-                                    Err(_) => break,  // TODO
+                                    StdinMessage::Eof => break,
                                 }
+
                             },
                             Err(_) => break,  // TODO: error propagation
                         }
@@ -365,14 +392,14 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for GameActor {
             Ok(ws::Message::Ping(msg)) => ctx.pong(&msg),
             Ok(ws::Message::Text(text)) => {
                 if let ProcessSt::Booted(p) = &mut self.process_st {
-                    if let Err(e) = p.stdin.send(text.into_bytes()) {
+                    if let Err(e) = p.stdin.send(StdinMessage::Data(text.into_bytes())) {
                         error!("error sending text to game process stdin (id = {}): {:?}", self.id, e);
                     };
                 }
             },
             Ok(ws::Message::Binary(bin)) => {
                 if let ProcessSt::Booted(p) = &mut self.process_st {
-                    if let Err(e) = p.stdin.send(bin.to_vec()) {
+                    if let Err(e) = p.stdin.send(StdinMessage::Data(bin.to_vec())) {
                         error!("error sending binary to game process stdin (id = {}): {:?}", self.id, e);
                     };
                 }
@@ -480,10 +507,12 @@ async fn main() -> std::io::Result<()> {
     // TODO: crash if static/ doesn't exist
 
     info!("starting actix HttpServer");
+    info!("static content will be served from static/");
+    let games_response_json = Bytes::from(to_games_json(&games_config)?);
     HttpServer::new(move || {
         let st = ServerState {
             next_game_id: AtomicUsize::new(0),
-            games_response_json: Bytes::from(to_games_json(&games_config)),
+            games_response_json: games_response_json.clone(),
             games_dir: games_dir.clone(),
             configs_by_id: games_config.iter().map(|cfg| (cfg.id.clone(), cfg.clone())).collect(),
         };
