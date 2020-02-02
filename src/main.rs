@@ -456,6 +456,7 @@ struct CliArgs {
     games_dir: String,
     socket_addr: SocketAddr,
     static_dir: PathBuf,
+    workers: usize,
 }
 
 fn parse_cli_args() -> io::Result<CliArgs> {
@@ -485,6 +486,13 @@ fn parse_cli_args() -> io::Result<CliArgs> {
              .value_name("DIR")
              .help("Directory from which static assets are served. The directory maps to the root of the server.")
              .default_value("static/")
+             .takes_value(true))
+        .arg(clap::Arg::with_name("workers")
+             .short("w")
+             .long("workers")
+             .value_name("NUM")
+             .help("Number of webserver workers handling connections")
+             .default_value("1")
              .takes_value(true))
         .get_matches();
 
@@ -516,17 +524,28 @@ fn parse_cli_args() -> io::Result<CliArgs> {
         Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{:?}: is not a directory", static_dir)))?
     }
 
-    Ok(CliArgs{ games_dir: games_dir, socket_addr: socket_addr, static_dir: static_dir })
+    let workers: &str = matches.value_of("static_assets").unwrap();
+    let workers: usize = workers.parse::<usize>().map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("{:?}: not a valid number", workers)))?;
+
+    Ok(CliArgs{
+        games_dir: games_dir,
+        socket_addr: socket_addr,
+        static_dir: static_dir,
+        workers: workers
+    })
 }
 
 #[actix_rt::main]
 async fn main() -> std::io::Result<()> {
-    std::env::set_var("RUST_LOG", "info");
+    // for static assets: don't really need more than one worker for
+    // serving files
     std::env::set_var("ACTIX_THREADPOOL", "1");
+
+    std::env::set_var("RUST_LOG", "info");
     env_logger::init();
 
     let cli_args = parse_cli_args()?;
-    info!("bootup args: games_dir = {}, socket_addr = {:?}, static_dir = {:?}", cli_args.games_dir, cli_args.socket_addr, cli_args.static_dir);
+    info!("bootup args: games_dir = {}, socket_addr = {:?}, static_dir = {:?}, workers = {}", cli_args.games_dir, cli_args.socket_addr, cli_args.static_dir, cli_args.workers);
 
     let games_dir = PathBuf::from(&cli_args.games_dir);
 
@@ -552,7 +571,7 @@ async fn main() -> std::io::Result<()> {
             .route("/api/play/{gameid}", web::get().to(play))
             .service(actix_files::Files::new("/", static_dir.clone()).index_file("index.html"))
     })
-    .workers(1)
+    .workers(cli_args.workers)
     .bind(cli_args.socket_addr)?
     .run()
     .await
