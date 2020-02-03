@@ -524,7 +524,7 @@ fn parse_cli_args() -> io::Result<CliArgs> {
         Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{:?}: is not a directory", static_dir)))?
     }
 
-    let workers: &str = matches.value_of("static_assets").unwrap();
+    let workers: &str = matches.value_of("workers").unwrap();
     let workers: usize = workers.parse::<usize>().map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("{:?}: not a valid number", workers)))?;
 
     Ok(CliArgs{
