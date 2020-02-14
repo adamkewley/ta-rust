@@ -1,5 +1,7 @@
 * {
     font-family: monospace;
+    font-weight: bold;
+    font-size: large;
     box-sizing: border-box;
     color: greenyellow;
 }
@@ -10,38 +12,45 @@ body, html {
     width: 100%;
     margin: 0;
     padding: 0;
-    background-color: #000;
+    background-color: #181818;
 }
 
 a {
     text-decoration: none;
 }
 
+.container {
+    margin: 0 auto;
+}
+
 #project-links {
-    position: fixed;
-    padding: 0;
-    right: 0;
-    top: 0;
+    padding: 1em;
+    opacity: 0.5;
+}
+
+.container main {
+    padding: 1ch;
+    background-color: #111;
 }
 
 
 /* Game list */
 
 ul {
-    padding: 0 0.5em;
+    padding: 0;
 }
 
 li {
     list-style-type: none;
     position: relative;
+    padding-top: 1em;
 }
 
-li:hover {
-    opacity: 0.8;
+li:hover:before {
+    content: ">>";
 }
 
 .game-title {
-    font-weight: bold;
     font-size: 1.5em;
 }
 
@@ -62,7 +71,8 @@ li:hover {
 
 /* Game interaction */
 
-#cursor {
+#cursor::after {
+    content: 'X';
     background-color: greenyellow;
     animation: blinker 1s steps(1, end) infinite;
 }
@@ -74,19 +84,17 @@ li:hover {
 }
 
 #game-output {
-    max-width: 50em;
+    width: 80ch;
+    overflow: hidden;
 }
 
 #text {
-    /* 4em for the input at bottom */
-    padding: 0 0 4em 0;
     white-space: pre-wrap;
 }
 
 .line {
     margin: 0;
     padding: 0;
-    overflow: hidden;
     animation: typing 4s steps(100, end);
 }
 
@@ -101,20 +109,26 @@ li:hover {
     color: grey;
 }
 
-#user-input, #user-input * {
+#user-form {
+    display: inline;
     margin: 0;
-    padding: 1em 0;
-    border: none;
-    position: fixed;
-    bottom: 0;
-    width: 100%;
-    background-color: #0a0a0a;
-    color: greenyellow;
+    padding: 0;
+    width: 0;
 }
-
-#user-input:focus {
+#user-input, #user-input * {
+    display: inline;
+    padding: 0;
+    margin: 0;
+    width: 0;
+    height: 0;
     border: none;
-    outline: none;
+    color: grey;
+    background-color: none;
+}
+#user-input-feedback {
+    margin: 0;
+    padding: 0;
+    color: grey;
 }
 
 .replay-btn {

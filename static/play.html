@@ -1,22 +1,29 @@
 <!DOCTYPE html>
 <html>
   <head>
+    <title>Text Adventurer: play game</title>
     <link rel="stylesheet" type="text/css" href="style.css">
      <meta charset="UTF-8">
   </head>
+
   <body>
     <div id="project-links">
       <a href="index.html">back</a>
       /
-      <a href="https://github.com/AdamK117/textadventurer-server">server-source</a>
-      /
-      <a href="https://github.com/AdamK117/textadventurer-ui">ui-source</a>
+      <a href="https://github.com/AdamK117/ta-rust">source</a>
     </div>
+
     <div id="game-output">
-      <span id="text"></span>
-      <span id="cursor">X</span>
+      <span id="text"></span><span id="user-input-feedback"></span><span id="cursor"></span>
+      <form id="user-form">
+        <input type="text"
+               id="user-input"
+               autofocus
+               autocomplete="off" />
+      </form>
     </div>
-    <input type="text" id="user-input" autofocus placeholder="enter text here" autocomplete="off">
+
     <script src="play.js"></script>
   </body>
+
 </html>
