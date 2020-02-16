@@ -282,7 +282,7 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for GameActor {
             Ok(mut proc) => {
                 let started_at = Instant::now();
                 let id = self.id;
-                let should_send_exit = Arc::new(AtomicBool::new(true));
+                let should_send_exit = Arc::new(AtomicBool::new(false));
 
                 let stdout_thread_name = format!("game_id {}: stdout reader", id);
                 let stdout_addr = ctx.address();
@@ -301,7 +301,7 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for GameActor {
                             let bytes = Bytes::copy_from_slice(&buf[0..sz]);
                             addr.do_send(StdoutMsg { bytes: bytes });
                         } else {
-                            if stdout_should_send_exit.compare_and_swap(true, false, Ordering::Relaxed) {
+                            if stdout_should_send_exit.swap(true, Ordering::Relaxed) {
                                 addr.do_send(ExitMsg{});
                             }
                             break;
@@ -327,7 +327,7 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for GameActor {
                             let bytes = Bytes::copy_from_slice(&buf[0..sz]);
                             addr.do_send(StdoutMsg { bytes: bytes });
                         } else {
-                            if stderr_should_send_exit.compare_and_swap(true, false, Ordering::Relaxed) {
+                            if stderr_should_send_exit.swap(true, Ordering::Relaxed) {
                                 addr.do_send(ExitMsg {});
                             }
                             break;
