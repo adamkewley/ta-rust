@@ -1,0 +1,5 @@
+name = "list root"
+description = "Run a bash script"
+author = "adamkewley (github)"
+application = "bash"
+args = [ "script.sh" ]
