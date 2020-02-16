@@ -24,6 +24,9 @@ a {
 }
 
 #project-links {
+    position: fixed;
+    top: 0;
+    right: 0;
     padding: 1em;
     opacity: 0.5;
 }
