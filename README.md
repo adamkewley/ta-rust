@@ -1,8 +1,7 @@
-# ta-rust
-# textadventurer (rust)
+# textadventurer
 
-An Actix webserver that uses websockets to connect command-line
-applications to browsers.
+A simple example of an Actix webserver that uses websockets to 
+connect command-line applications to browsers.
 
 ![ui video demo](docs/ta.gif)
 
