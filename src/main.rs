@@ -49,7 +49,6 @@ struct ServerState {
 
 #[derive(Clone, Deserialize)]
 struct GameConfig {
-    id: String,
     name: String,
     description: String,
     author: String,
@@ -57,19 +56,19 @@ struct GameConfig {
     args: Vec<String>,
 }
 
-fn to_game_response(config: &GameConfig) -> GameResponse {
+fn to_game_response(config: &(String, GameConfig)) -> GameResponse {
     GameResponse {
-        id: config.id.clone(),
-        name: config.name.clone(),
-        author: config.author.clone(),
-        description: config.description.clone(),
+        id: config.0.clone(),
+        name: config.1.name.clone(),
+        author: config.1.author.clone(),
+        description: config.1.description.clone(),
         play: GamePlayDetailsResponse {
-            url: format!("/play/{}", config.id),
+            url: format!("/play/{}", config.0),
         }
     }
 }
 
-fn to_games_json(configs: &Vec<GameConfig>) -> Result<Vec<u8>, serde_json::error::Error> {
+fn to_games_json(configs: &Vec<(String, GameConfig)>) -> Result<Vec<u8>, serde_json::error::Error> {
     let resp = GamesResponse {
         games: configs.iter().map(|cfg| to_game_response(cfg)).collect(),
     };
@@ -103,7 +102,7 @@ fn load_config(config_path: &Path) -> std::io::Result<GameConfig> {
     Ok(toml::from_str(&s)?)
 }
 
-fn load_game_configs(games_dir: &Path) -> std::io::Result<Vec<GameConfig>> {
+fn load_game_configs(games_dir: &Path) -> std::io::Result<Vec<(String, GameConfig)>> {
     if !games_dir.exists() {
         let msg = format!("{}: no such file or directory", games_dir.display());
         return Err(io::Error::new(ErrorKind::NotFound, msg));
@@ -114,10 +113,11 @@ fn load_game_configs(games_dir: &Path) -> std::io::Result<Vec<GameConfig>> {
         return Err(io::Error::new(ErrorKind::InvalidInput, msg));
     }
 
-    let mut configs = Vec::<GameConfig>::new();
+    let mut configs = Vec::<(String, GameConfig)>::new();
 
     for entry in fs::read_dir(games_dir)? {
         let entry = entry?;
+        let game_id = entry.file_name().into_string().map_err(|os_str| io::Error::new(io::ErrorKind::InvalidInput, format!("{:?}: not a valid number", os_str)))?;
         let path = entry.path();
 
         if should_ignore(&path)? {
@@ -132,8 +132,8 @@ fn load_game_configs(games_dir: &Path) -> std::io::Result<Vec<GameConfig>> {
 
         if cfg_path.is_file() {
             let cfg = load_config(&cfg_path)?;
-            info!("loaded {:?}: id = {}, name = {}, application = {}", cfg_path, cfg.id, cfg.name, cfg.application);
-            configs.push(cfg);
+            info!("loaded {:?}: id = {}, name = {}, application = {}", cfg_path, game_id, cfg.name, cfg.application);
+            configs.push((game_id, cfg));
         }
     }
 
@@ -443,7 +443,7 @@ async fn play(st: web::Data<ServerState>,
     let gameid = req.match_info().query("gameid");
     match st.configs_by_id.get(gameid) {
         Some(cfg) => {
-            let game_dir = st.games_dir.join(gameid).join("game-files");
+            let game_dir = st.games_dir.join(gameid);
             let game_id = st.next_game_id.fetch_add(1, Ordering::Relaxed);
             let actor = GameActor::new(game_id, game_dir, cfg.clone());
             ws::start(actor, &req, stream)
@@ -561,7 +561,7 @@ async fn main() -> std::io::Result<()> {
             next_game_id: AtomicUsize::new(0),
             games_response_json: games_response_json.clone(),
             games_dir: games_dir.clone(),
-            configs_by_id: games_config.iter().map(|cfg| (cfg.id.clone(), cfg.clone())).collect(),
+            configs_by_id: games_config.iter().map(|t| t.clone()).collect(),
         };
 
         App::new()
