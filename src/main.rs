@@ -137,6 +137,8 @@ fn load_game_configs(games_dir: &Path) -> std::io::Result<Vec<(String, GameConfi
         }
     }
 
+    configs.sort_by(|(_, conf1), (_, conf2)| conf1.name.cmp(&conf2.name));
+
     Ok(configs)
 }
 
