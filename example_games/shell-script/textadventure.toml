@@ -1,4 +1,4 @@
-name = "list root"
+name = "Basic Bash Script"
 description = "Run a bash script"
 author = "adamkewley (github)"
 application = "bash"
