@@ -12,7 +12,7 @@ use std::time::Instant;
 use std::mem;
 
 use actix::{Actor, Running, Message, Handler, StreamHandler, ActorContext, AsyncContext};
-use actix_web::{web, http, App, HttpRequest, HttpResponse, HttpServer, Responder, body::Body};
+use actix_web::{web, http, App, HttpRequest, HttpResponse, HttpServer, Responder};
 use actix_web_actors::ws;
 use actix_files;
 use bytes::Bytes;
@@ -42,9 +42,8 @@ struct GamePlayDetailsResponse {
 
 struct ServerState {
     next_game_id: AtomicUsize,
-    games_response_json: Bytes,
+    configs: Arc<dyn GamesLoader>,
     games_dir: PathBuf,
-    configs_by_id: HashMap<String, GameConfig>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -132,7 +131,6 @@ fn load_game_configs(games_dir: &Path) -> std::io::Result<Vec<(String, GameConfi
 
         if cfg_path.is_file() {
             let cfg = load_config(&cfg_path)?;
-            info!("loaded {:?}: id = {}, name = {}, application = {}", cfg_path, game_id, cfg.name, cfg.application);
             configs.push((game_id, cfg));
         }
     }
@@ -143,9 +141,18 @@ fn load_game_configs(games_dir: &Path) -> std::io::Result<Vec<(String, GameConfi
 }
 
 async fn games(st: web::Data<ServerState>) -> impl Responder {
-    HttpResponse::Ok()
-        .header(http::header::CONTENT_TYPE, "application/json")
-        .body(Body::Bytes(st.games_response_json.clone()))
+    match st.configs.load_games_list_as_json() {
+        Ok(json) => {
+            HttpResponse::Ok()
+                .header(http::header::CONTENT_TYPE, "application/json")
+                .body(json)
+        },
+        Err(e) => {
+            error!("error loading games: {:?}", e);
+            HttpResponse::InternalServerError().finish()
+        },
+    }
+
 }
 
 enum ProcessSt {
@@ -183,7 +190,7 @@ struct BootedProcess {
 
 struct GameActor {
     id: usize,
-    config: GameConfig,
+    config: Arc<GameConfig>,
     game_dir: PathBuf,
     process_st: ProcessSt,
 }
@@ -203,12 +210,12 @@ impl Message for ExitMsg {
 }
 
 impl GameActor {
-    fn new(id: usize, game_dir: PathBuf, config: GameConfig) -> Self {
+    fn new(id: usize, game_dir: PathBuf, config: Arc<GameConfig>) -> Self {
         Self {
             id: id,
             game_dir: game_dir,
             config: config,
-            process_st: ProcessSt::Booting
+            process_st: ProcessSt::Booting,
         }
     }
 }
@@ -443,14 +450,23 @@ async fn play(st: web::Data<ServerState>,
               stream: web::Payload) -> Result<HttpResponse, actix_web::Error> {
 
     let gameid = req.match_info().query("gameid");
-    match st.configs_by_id.get(gameid) {
-        Some(cfg) => {
+    match st.configs.get_game_by_id(gameid) {
+        Ok(cfg) => {
             let game_dir = st.games_dir.join(gameid);
             let game_id = st.next_game_id.fetch_add(1, Ordering::Relaxed);
-            let actor = GameActor::new(game_id, game_dir, cfg.clone());
+            let actor = GameActor::new(game_id, game_dir, cfg);
             ws::start(actor, &req, stream)
+        },
+        Err(e) => {
+            match e.kind() {
+                ErrorKind::NotFound => {
+                    Ok(HttpResponse::NotFound().finish())
+                },
+                _ => {
+                    Ok(HttpResponse::InternalServerError().finish())
+                },
+            }
         }
-        None => Ok(HttpResponse::NotFound().finish()),
     }
 }
 
@@ -459,6 +475,7 @@ struct CliArgs {
     socket_addr: SocketAddr,
     static_dir: PathBuf,
     workers: usize,
+    cache_game_configs: bool,
 }
 
 fn parse_cli_args() -> io::Result<CliArgs> {
@@ -496,6 +513,10 @@ fn parse_cli_args() -> io::Result<CliArgs> {
              .help("Number of webserver workers handling connections")
              .default_value("1")
              .takes_value(true))
+        .arg(clap::Arg::with_name("cache-games")
+             .short("c")
+             .help("Cache game configurations when the server initially boots, rather than loading them for on each request.")
+             .takes_value(false))
         .get_matches();
 
     let games_dir: String = matches.value_of("GAMES_DIR").unwrap().to_string();
@@ -533,8 +554,70 @@ fn parse_cli_args() -> io::Result<CliArgs> {
         games_dir: games_dir,
         socket_addr: socket_addr,
         static_dir: static_dir,
-        workers: workers
+        workers: workers,
+        cache_game_configs: matches.is_present("cache-configs"),
     })
+}
+
+trait GamesLoader: Send + Sync {
+    fn load_games_list_as_json(&self) -> std::io::Result<Bytes>;
+    fn get_game_by_id(&self, id: &str) -> std::io::Result<Arc<GameConfig>>;
+}
+
+struct StaticGamesLoader {
+    json: Bytes,
+    configs_by_id: HashMap<String, Arc<GameConfig>>,
+}
+
+impl StaticGamesLoader {
+    fn new(games_dir: &Path) -> io::Result<Self> {
+        info!("cache enabled: preloading game configs by iterating over subdirs in {:?}", games_dir);
+        let games_configs = load_game_configs(&games_dir)?;
+        for (k, cfg) in &games_configs {
+            info!("loaded game: id = {}, name = {}, application = {}", k, cfg.name, cfg.application);
+        }
+        let games_response_json = Bytes::from(to_games_json(&games_configs)?);
+        let configs_by_id = games_configs.iter().map(|(k, v)| (k.clone(), Arc::new(v.clone()))).collect();
+        Ok(StaticGamesLoader { json: games_response_json, configs_by_id })
+    }
+}
+
+impl GamesLoader for StaticGamesLoader {
+    fn load_games_list_as_json(&self) -> std::io::Result<Bytes> {
+        Ok(self.json.clone())
+    }
+
+    fn get_game_by_id(&self, id: &str) -> std::io::Result<Arc<GameConfig>> {
+        let cfg = self.configs_by_id.get(id).ok_or(io::Error::new(ErrorKind::NotFound, "could not find game"))?;
+        Ok(cfg.clone())
+    }
+}
+
+struct LazyGamesLoader {
+    games_dir: PathBuf,
+}
+
+impl LazyGamesLoader {
+    fn new(games_dir: &Path) -> io::Result<Self> {
+        info!("cache disabled: games will be loaded on-request by iterating over subdirs in {:?}", games_dir);
+        Ok(LazyGamesLoader { games_dir: games_dir.clone().to_path_buf() })
+    }
+}
+
+impl GamesLoader for LazyGamesLoader {
+    fn load_games_list_as_json(&self) -> std::io::Result<Bytes> {
+        debug!("loading game configs");
+        let games_configs = load_game_configs(&self.games_dir)?;
+        let games_response_json = Bytes::from(to_games_json(&games_configs)?);
+        Ok(games_response_json)
+    }
+
+    fn get_game_by_id(&self, id: &str) -> std::io::Result<Arc<GameConfig>> {
+        let games_configs = load_game_configs(&self.games_dir)?;
+        let configs_by_id: HashMap<String, Arc<GameConfig>> = games_configs.iter().map(|(k, v)| (k.clone(), Arc::new(v.clone()))).collect();
+        let config = configs_by_id.get(id).ok_or(io::Error::new(ErrorKind::NotFound, "could not find game"))?;
+        Ok(config.clone())
+    }
 }
 
 #[actix_rt::main]
@@ -552,18 +635,20 @@ async fn main() -> std::io::Result<()> {
     let games_dir = PathBuf::from(&cli_args.games_dir);
 
     info!("starting bootup");
-    info!("loading game configs by iterating over dirs in {:?}", games_dir);
-    let games_config = Arc::new(load_game_configs(&games_dir)?);
+    let games_loader: Arc<dyn GamesLoader> =
+        if cli_args.cache_game_configs {
+            Arc::new(StaticGamesLoader::new(&games_dir)?)
+        } else {
+            Arc::new(LazyGamesLoader::new(&games_dir)?)
+        };
 
     info!("starting actix HttpServer");
-    let games_response_json = Bytes::from(to_games_json(&games_config)?);
     let static_dir = cli_args.static_dir;
     HttpServer::new(move || {
         let st = ServerState {
             next_game_id: AtomicUsize::new(0),
-            games_response_json: games_response_json.clone(),
+            configs: games_loader.clone(),
             games_dir: games_dir.clone(),
-            configs_by_id: games_config.iter().map(|t| t.clone()).collect(),
         };
 
         App::new()
