@@ -14,11 +14,11 @@ use std::mem;
 use actix::{Actor, Running, Message, Handler, StreamHandler, ActorContext, AsyncContext};
 use actix_web::{web, http, App, HttpRequest, HttpResponse, HttpServer, Responder};
 use actix_web_actors::ws;
-use actix_files;
 use bytes::Bytes;
 use serde_derive::{Deserialize, Serialize};
 use clap;
 use toml;
+use rust_embed::RustEmbed;
 #[macro_use] extern crate log;
 
 #[derive(Serialize, Deserialize)]
@@ -152,7 +152,22 @@ async fn games(st: web::Data<ServerState>) -> impl Responder {
             HttpResponse::InternalServerError().finish()
         },
     }
+}
 
+#[derive(RustEmbed)]
+#[folder = "static"]
+struct StaticAsset;
+
+async fn get_static_asset(path: web::Path<(String,)>) -> impl Responder {
+    match StaticAsset::get(&path.0) {
+        Some(cow) => HttpResponse::Ok().body(cow.into_owned()),
+        None => HttpResponse::NotFound().finish()
+    }
+}
+
+async fn get_index() -> impl Responder {
+    let t = (String::from("index.html"),);
+    get_static_asset(web::Path::from(t)).await
 }
 
 enum ProcessSt {
@@ -473,7 +488,6 @@ async fn play(st: web::Data<ServerState>,
 struct CliArgs {
     games_dir: String,
     socket_addr: SocketAddr,
-    static_dir: PathBuf,
     workers: usize,
     cache_game_configs: bool,
 }
@@ -498,13 +512,6 @@ fn parse_cli_args() -> io::Result<CliArgs> {
              .value_name("IP")
              .help("Binds server to the specified IP")
              .default_value("0.0.0.0")
-             .takes_value(true))
-        .arg(clap::Arg::with_name("static_assets")
-             .short("s")
-             .long("static-assets")
-             .value_name("DIR")
-             .help("Directory from which static assets are served. The directory maps to the root of the server.")
-             .default_value("static/")
              .takes_value(true))
         .arg(clap::Arg::with_name("workers")
              .short("w")
@@ -537,23 +544,12 @@ fn parse_cli_args() -> io::Result<CliArgs> {
 
     let socket_addr = SocketAddr::new(ip, port);
 
-    let static_dir: PathBuf = matches.value_of("static_assets").unwrap().to_string().parse().unwrap();
-
-    if !static_dir.exists() {
-        Err(io::Error::new(io::ErrorKind::NotFound, format!("{:?}: no such file or directory", static_dir)))?
-    }
-
-    if !static_dir.is_dir() {
-        Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{:?}: is not a directory", static_dir)))?
-    }
-
     let workers: &str = matches.value_of("workers").unwrap();
     let workers: usize = workers.parse::<usize>().map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("{:?}: not a valid number", workers)))?;
 
     Ok(CliArgs{
         games_dir: games_dir,
         socket_addr: socket_addr,
-        static_dir: static_dir,
         workers: workers,
         cache_game_configs: matches.is_present("cache-configs"),
     })
@@ -622,15 +618,11 @@ impl GamesLoader for LazyGamesLoader {
 
 #[actix_rt::main]
 async fn main() -> std::io::Result<()> {
-    // for static assets: don't really need more than one worker for
-    // serving files
-    std::env::set_var("ACTIX_THREADPOOL", "1");
-
     std::env::set_var("RUST_LOG", "info");
     env_logger::init();
 
     let cli_args = parse_cli_args()?;
-    info!("bootup args: games_dir = {}, socket_addr = {:?}, static_dir = {:?}, workers = {}", cli_args.games_dir, cli_args.socket_addr, cli_args.static_dir, cli_args.workers);
+    info!("bootup args: games_dir = {}, socket_addr = {:?}, workers = {}", cli_args.games_dir, cli_args.socket_addr, cli_args.workers);
 
     let games_dir = PathBuf::from(&cli_args.games_dir);
 
@@ -643,7 +635,6 @@ async fn main() -> std::io::Result<()> {
         };
 
     info!("starting actix HttpServer");
-    let static_dir = cli_args.static_dir;
     HttpServer::new(move || {
         let st = ServerState {
             next_game_id: AtomicUsize::new(0),
@@ -656,7 +647,8 @@ async fn main() -> std::io::Result<()> {
             .wrap(actix_web::middleware::Logger::default())
             .route("/api/games", web::get().to(games))
             .route("/api/play/{gameid}", web::get().to(play))
-            .service(actix_files::Files::new("/", static_dir.clone()).index_file("index.html"))
+            .route("/{asset}", web::get().to(get_static_asset))
+            .route("/", web::get().to(get_index))
     })
     .workers(cli_args.workers)
     .bind(cli_args.socket_addr)?
