@@ -1,5 +1,5 @@
 name = "Explain Text Adventurer"
 description = "A short explanation of text adventurer delivered through the medium of text adventurer."
 author = "adamkewley (github)"
-application = "python"
+application = "python3"
 args = [ "-u", "game.py" ]

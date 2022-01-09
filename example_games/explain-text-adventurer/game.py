@@ -2,7 +2,7 @@ import sys
 from time import sleep
 
 print("Ask me what text-adventurer is")
-raw_input()
+input()
 
 print("I didn't even check what you wrote.")
 print("text-adventurer pipes command-line applications into a browser")
@@ -23,6 +23,6 @@ with open("bulbasaur.txt", "r") as bulbasaur:
     print(bulbasaur_ascii)
 
 print("Any more questions?")
-question = raw_input()
+question = input()
 
 print("I know you wrote '" + question + "' but, again, I'm not even going to try and handle it. I'm a simple application with no branching. Live with that. See you later.")
